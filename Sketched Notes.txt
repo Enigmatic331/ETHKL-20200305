@@ -1,0 +1,126 @@
+=================
+First Hack - 0x4f4e0f2cb72E718fC0433222768c57e823162152
+=================
+
+Step 1.
+We need liquidity. Flash borrow 10k from dYdX - 0x1E0447b19BB6EcFdAe1e4AE1694b0C3659614e4e.operate with the actions to withdraw and callback to exploit contract.
+Balance: 10,000ETH
+
+Step 2.
+Use borrowed ETH to convert into WBTC.
+
+	Substep 1: 0x4Ddc2D193948926D02f9B1fE9e1daa0718270ED5.mint() - To mint ETH equivalent of cTokens
+	5500ETH sent and 5500cETH minted.
+	5500cETH  sent to cWBTC, to borrow wBTC.
+	
+	Substep 2: 0xC11b1268C1A384e55C48c2391d8d480264A3A7F4.borrow() - To borrow cWBTC equivalent of 5500cETH - Total 112WBTC.
+
+Balance: 4500ETH, 112WBTC.
+
+Step 3.
+Short market ETH/WTBC - 1300ETH with 5x leverage
+0xb0200B0677dD825bb32B93d055eBb9dc3521db9D.mintWithEther.
+
+1300ETH is converted into WTBC collateral of 5x short. This has to happen:
+	
+	Substep 1: Borrow x4 from iETH pool (so total x5).
+	Substep 2: Convert all ETH (iETH) to WTBC - Looks up Kyber for liquidity (which only Uniswap has sufficiently at that point of time).
+
+x5 short, translates to a collateral of 20% of the short position. So if the slippage when Kyber gets liquidity from reserve is <20%, we are OK. Total ETH borrowed from bZx contracts will be < total WBTC purchased.
+
+THE MAIN QUESTION: WHY DID THE SLIPPAGE PROTECTION NOT KICK IN?
+
+Proxy contract (0xb0200b0677dd825bb32b93d055ebb9dc3521db9d) > Implementation on 0x579ad3c8abc3658341044c1c6d6dc48f9e015026:
+mintWithEther(2 params) > mintWithEther(3 params) _mintWithToken > _triggerPosition > ILoanToken(loanTokenLender).marginTradeFromDeposit
+
+Proxy contract (0x77f973FCaF871459aa58cd81881Ce453759281bC) > Implementation on 0xc77EE4283b6853900282d5fc498555F642aa52a7
+marginTradeFromDeposit > _borrowTokenAndUse > _borrowTokenAndUseFinal > takeOrderFromiToken
+
+The final contract which should call the slippage check is on BZxProxy (0x1cf226e9413addaf22412a2e182f9c0de44af002) which its implementation doesn't seem to be verified (0xF0A42Ec4Ebb7664af5daE5c3209345d545da838A - look for signature hash b1eac3ad), but we can get the code from: https://github.com/bZxNetwork/bZx-monorepo/blob/feb34f7c6e4e1aac8691408f4a6ecde9bf22b715/packages/contracts/contracts/modules/iTokens_loanOpeningFunctions.sol#L148
+
+0xb0200b0677dd825bb32b93d055ebb9dc3521db9d.mintWithEther(2 params) calls mintWithEther(3 params) without loanDataBytes, and cascades ALL the way down...
+Subsequently doesn't trigger.
+
+        require ((
+                loanDataBytes.length == 0 && // Kyber only
+                sentAmounts[6] == sentAmounts[1]) || // newLoanAmount
+            !OracleInterface(oracle).shouldLiquidate(
+                loanOrder,
+                loanPosition
+            ),
+            "unhealthy position"
+        );
+
+Balance: 3200ETH, 112WBTC. 51WBTC in bZx.
+And a super low ETH/BTC rate on Uniswap (0.0163).
+
+
+Step 4. Sell 112WBTC back into Uniswap. 112WBTC/0.0163 = 6871ETH.
+Balance = 10071ETH. 
+
+Step 5. Repay dYdX on first step. Balance left with leftovers (~65ETH) and a 5500ETH position in Compound. All they need to do now is to repay the 112WBTC, and they can reclaim the 5500ETH. Assuming 1BTC at 36ETH, they'd just need to spend 112*36=4032 to reclaim 5500ETH.
+
+E.g. https://etherscan.io/tx/0x136fab28b0d107406e75ebb23dde48d5c4be7da2f7e04468292fe3496cfe7dde
+
+
+
+
+
+
+
+
+==================
+Second Hack - 0x360f85F0B74326CDDfF33A812B05353BC537747B
+==================
+
+Flash borrow 7500 from bZx (0x77f973fcaf871459aa58cd81881ce453759281bc.flashBorrowToken)
+
+Balance: 7500ETH
+
+900 ETH to buy (0x818e6fecd516ecc3849daf6845e3ec868087b755.swapEtherToToken)
+- 540 ether
+- 18*20 ether
+
+Balance: 6600ETH
+
+Exchanging ethers to synth (total 6000eth) to get sUSD
+0x172e09691dfbbc035e37c73b62095caa16ee2388.exchangeEtherForSynths
+	- 3,517.859101713642764819 Ether (3517 got exchanged)
+	- 2,482.14089828635723518 Ether (refunded)
+
+Balance: 600ETH + 2482.14ETH = 3082.14ETH
+
+Borrow token from deposit
+0x85CA13d8496b2D22D6518fAeB524911E096Dd7E0.borrowTokenFromDeposit
+
+ borrowTokenFromDeposit ( borrowAmount: 0 , leverageAmount: 2000000000000000000 , initialLoanDuration: 604800 , collateralTokenSent: 1099841392100433025126219 , borrower: 360f85f0b74326cdd... , receiver: 360f85f0b74326cdd... , collateralTokenAddress: 57ab1ec28d1297070... , loanDataBytes: [""] )
+ 
+At this point, sUSD is priced at (?) amount which isn't 1USD. Gotten  6,796ETH from bZx. For 3517.85 sUSD.
+
+Balance: 600+2482.14 + 6796 = 9878.14
+
+Returns 7500 to wETH.
+
+Balance = 9878.14 - 7500 = 2378.14
+
+
+So the contract should look something like (just need to be mindful to point to the proxy instead of implementation):
+
+Step 1. 0x77f973fcaf871459aa58cd81881ce453759281bc.flashBorrowToken
+Step 2. 0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.withdraw
+Step 3. 0x818e6fecd516ecc3849daf6845e3ec868087b755.swapEtherToToken
+	- Happens multiple times
+Step 4. 0x172e09691dfbbc035e37c73b62095caa16ee2388.exchangeEtherForSynths
+Step 5. 0x77f973fcaf871459aa58cd81881ce453759281bc.borrowTokenFromDeposit (using synth as collateral to get ETH)
+
+At this point the attacker doesn't even need to repay the stuff done on step 5, and walk away with the profit. Just needed to repay for step 1, which is simply:
+
+// verifies return of flash loan
+require(
+	address(this).balance >= beforeEtherBalance &&
+	ERC20(loanTokenAddress).balanceOf(address(this))
+		.add(totalAssetBorrow) >= beforeAssetsBalance,
+	"40"
+);
+
+Ensuring the contract has its balance back.
